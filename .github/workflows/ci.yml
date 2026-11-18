@@ -1,0 +1,110 @@
+name: CI
+
+# Builds the Nerves system on a GitHub-hosted runner for every pushed v* tag
+# and publishes the artifact (<name>-portable-<version>-<checksum>.tar.gz) as
+# a prerelease for that tag. Can also be started by hand (no release then).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  OTP_VERSION: 29.1.2
+  ELIXIR_VERSION: 1.20.5
+  NERVES_BOOTSTRAP_VERSION: 1.17.4
+  FWUP_VERSION: 1.17.0
+
+permissions:
+  contents: read
+
+jobs:
+  build-system:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake bc build-essential bzip2 ca-certificates cpio \
+            curl file git libarchive-dev libconfuse-dev libmnl-dev \
+            libncurses5-dev libssl-dev libtool pkg-config python3 rsync \
+            squashfs-tools unzip wget xz-utils
+
+      - name: Install fwup
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --depth 1 -b "v${FWUP_VERSION}" https://github.com/fwup-home/fwup
+          cd fwup
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+          fwup --version
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-type: strict
+
+      - name: Install nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix archive.install hex nerves_bootstrap "${NERVES_BOOTSTRAP_VERSION}" --force
+
+      - name: Cache Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.nerves/dl
+          key: nerves-dl-${{ hashFiles('nerves_defconfig', 'mix.exs', 'packages/**/*.mk') }}
+          restore-keys: |
+            nerves-dl-
+
+      - name: Build system
+        run: |
+          mix deps.get
+          mix compile
+
+      - name: Create artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          mix nerves.artifact nerves_system_tickwatch_pro3 --path "$RUNNER_TEMP/artifacts"
+          ls -l "$RUNNER_TEMP/artifacts"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nerves-system-artifact
+          path: ${{ runner.temp }}/artifacts/*
+          retention-days: 7
+
+      - name: Publish prerelease
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$RUNNER_TEMP"/artifacts/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$RUNNER_TEMP"/artifacts/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --prerelease \
+              --title "$TAG" \
+              --notes "Prebuilt Nerves system artifact for $TAG. See CHANGELOG.md."
+          fi
